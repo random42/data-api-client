@@ -575,7 +575,7 @@ const init = params => {
       deserializeDate:
         typeof params.formatOptions === 'object' && params.formatOptions.deserializeDate === false ? false : true,
       treatAsLocalDate:
-        typeof params.formatOptions === 'object' && params.formatOptions.treatAsLocalDate
+        typeof params.formatOptions === 'object' && params.formatOptions.treatAsLocalDate,
       convertSnakeToCamel: params.convertSnakeToCamel
         || typeof params.formatOptions === 'object' && params.formatOptions.convertSnakeToCamel
         || false,
