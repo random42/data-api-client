@@ -144,9 +144,9 @@ describe('query configuration parsing', () => {
       expect(result).toBe('db')
     })
 
-    test('no database provided (error)', async () => {
-      let result = () => parseDatabase({}, [{}])
-      expect(result).toThrow(`No 'database' provided.`)
+    test('no database provided (return undefined)', async () => {
+      let result = parseDatabase({}, [{}])
+      expect(result).toBe.undefined
     })
 
   }) // end parseDatabase
@@ -375,6 +375,7 @@ describe('query parameter processing', () => {
 
     test('single param, single record', async () => {
       let { processedParams,escapedSql } = processParams(
+        'pg',
         'SELECT * FROM myTable WHERE id = :id',
         { id: { type: 'n_ph' } },
         [{ name: 'id', value: 1 }]
@@ -387,6 +388,7 @@ describe('query parameter processing', () => {
 
     test('mulitple params, named param, single record', async () => {
       let { processedParams,escapedSql } = processParams(
+        'pg',
         'SELECT ::columnName FROM myTable WHERE id = :id AND id2 = :id2',
         { id: { type: 'n_ph' }, id2: { type: 'n_ph' }, columnName: { type: 'n_id' } },
         [
@@ -404,6 +406,7 @@ describe('query parameter processing', () => {
 
     test('single param, multiple records', async () => {
       let { processedParams,escapedSql } = processParams(
+        'pg',
         'SELECT * FROM myTable WHERE id = :id',
         { id: { type: 'n_ph' } },
         [
@@ -420,6 +423,7 @@ describe('query parameter processing', () => {
 
     test('multiple params, multiple records', async () => {
       let { processedParams,escapedSql } = processParams(
+        'pg',
         'SELECT * FROM myTable WHERE id = :id',
         { id: { type: 'n_ph' }, id2: { type: 'n_ph' } },
         [
@@ -436,6 +440,7 @@ describe('query parameter processing', () => {
 
     test('mulitple params, named params, multiple records', async () => {
       let { processedParams,escapedSql } = processParams(
+        'pg',
         'SELECT ::columnName FROM myTable WHERE id = :id AND id2 = :id2',
         { id: { type: 'n_ph' }, id2: { type: 'n_ph' }, columnName: { type: 'n_id' } },
         [
@@ -461,6 +466,25 @@ describe('query parameter processing', () => {
           { name: 'id', value: { longValue: 2 } },
           { name: 'id2', value: { longValue: 3 } }
         ]
+      ])
+    })
+
+    test('typecasting params', async () => {
+      let { processedParams,escapedSql } = processParams(
+        'pg',
+        'INSERT INTO users(id, name, meta) VALUES(:id, :name, :meta)',
+        { id: { type: 'n_ph' }, name: { type: 'n_ph' }, meta: { type: 'n_ph' } },
+        [
+          { name: 'id', value: '0bb99248-2e7d-4007-a4b2-579b00649ce1', cast: 'uuid' },
+          { name: 'name', value: 'Test' },
+          { name: 'meta', value: '{"extra": true}', cast: 'jsonb' }
+        ]
+      )
+      expect(escapedSql).toBe('INSERT INTO users(id, name, meta) VALUES(:id::uuid, :name, :meta::jsonb)')
+      expect(processedParams).toEqual([
+        { name: 'id', value: { stringValue: '0bb99248-2e7d-4007-a4b2-579b00649ce1' } },
+        { name: 'name', value: { stringValue: 'Test' } },
+        { name: 'meta', value: { stringValue: '{"extra": true}' } }
       ])
     })
 
@@ -520,7 +544,7 @@ describe('querying', () => {
 
     test('with columnMetadata', async () => {
       let { records, columnMetadata } = require('./test/sample-query-response.json')
-      let result = formatRecords(records, columnMetadata)
+      let result = formatRecords(records, columnMetadata, true)
       expect(result).toEqual([
         {
           created: '2019-11-12 22:00:11',
@@ -606,6 +630,31 @@ describe('formatResults', () => {
     })
   })
 
+  test('select (hydrate) with date deserialization', async () => {
+    let response = require('./test/sample-query-response.json')
+    let result = formatResults(response,true,false,{deserializeDate: true})
+    expect(result).toEqual({
+      records: [
+        {
+          created: new Date('2019-11-12T22:00:11Z'),
+          deleted: null,
+          description: null,
+          id: 1,
+          modified: new Date('2019-11-12T22:15:25Z'),
+          name: 'Category 1'
+        },
+        {
+          created: new Date('2019-11-12T22:17:11Z'),
+          deleted: null,
+          description: 'Description of Category 2',
+          id: 2,
+          modified: new Date('2019-11-12T22:21:36Z'),
+          name: 'Category 2'
+        }
+      ]
+    })
+  })
+
 
   test('select (no hydrate)', async () => {
     let response = require('./test/sample-query-response.json')
@@ -627,6 +676,28 @@ describe('formatResults', () => {
       records: [
         [ 1, 'Category 1', null, '2019-11-12 22:00:11', '2019-11-12 22:15:25', null ],
         [ 2, 'Category 2', 'Description of Category 2', '2019-11-12 22:17:11', '2019-11-12 22:21:36', null ]
+      ]
+    })
+  })
+
+  test('select (with date deserialization to UTC)', async () => {
+    let response = require('./test/sample-query-response.json')
+    let result = formatResults(response,false,false, { deserializeDate: true })
+    expect(result).toEqual({
+      records: [
+        [ 1, 'Category 1', null, new Date('2019-11-12T22:00:11.000Z'), new Date('2019-11-12T22:15:25.000Z'), null ],
+        [ 2, 'Category 2', 'Description of Category 2', new Date('2019-11-12T22:17:11.000Z'), new Date('2019-11-12T22:21:36.000Z'), null ]
+      ]
+    })
+  })
+
+  test('select (with date deserialization to local TZ)', async () => {
+    let response = require('./test/sample-query-response.json')
+    let result = formatResults(response,false,false, { deserializeDate: true, treatAsLocalDate: true })
+    expect(result).toEqual({
+      records: [
+        [ 1, 'Category 1', null, new Date('2019-11-12 22:00:11'), new Date('2019-11-12 22:15:25'), null ],
+        [ 2, 'Category 2', 'Description of Category 2', new Date('2019-11-12 22:17:11'), new Date('2019-11-12 22:21:36'), null ]
       ]
     })
   })

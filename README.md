@@ -24,16 +24,20 @@ const data = require('data-api-client')({
 
 // Simple SELECT
 let result = await data.query(`SELECT * FROM myTable`)
-// [ { id: 1, name: 'Alice', age: null },
-//   { id: 2, name: 'Mike', age: 52 },
-//   { id: 3, name: 'Carol', age: 50 } ]
+// {
+//   records: [
+//     { id: 1, name: 'Alice', age: null },
+//     { id: 2, name: 'Mike', age: 52 },
+//     { id: 3, name: 'Carol', age: 50 }
+//   ]
+// }
 
 // SELECT with named parameters
 let resultParams = await data.query(
   `SELECT * FROM myTable WHERE id = :id`,
   { id: 2 }
 )
-// [ { id: 2, name: 'Mike', age: 52 } ]
+// { records: [ { id: 2, name: 'Mike', age: 52 } ] }
 
 // INSERT with named parameters
 let insert = await data.query(
@@ -133,11 +137,17 @@ Below is a table containing all of the possible configuration options for the `d
 | resourceArn | `string` | The ARN of your Aurora Serverless Cluster. This value is *required*, but can be overridden when querying. |  |
 | secretArn | `string` | The ARN of the secret associated with your database credentials. This is *required*, but can be overridden when querying. |  |
 | database | `string` | *Optional* default database to use with queries. Can be overridden when querying. |  |
+| engine | `mysql` or `pg` | The type of database engine you're connecting to (MySQL or Postgres). | `mysql` |
 | hydrateColumnNames | `boolean` | When `true`, results will be returned as objects with column names as keys. If `false`, results will be returned as an array of values. | `true` |
-| keepAlive | `boolean` | Enables HTTP Keep-Alive for calls to the AWS SDK. This dramatically decreases the latency of subsequent calls. | `true` |
-| sslEnabled | `boolean` | *Optional* Enables SSL HTTP endpoint. Can be disable for local development. | `true` |
+| ~~keepAlive~~ (deprecated) | `boolean` | See [Connection Reuse](#connection-reuse) below. | |
+| ~~sslEnabled~~ (deprecated) | `boolean` | Set this in the `options` | `true` |
 | options | `object` | An *optional* configuration object that is passed directly into the RDSDataService constructor. See [here](https://docs.aws.amazon.com/AWSJavaScriptSDK/latest/AWS/RDSDataService.html#constructor-property) for available options.  | `{}` |
-| region | `string`  | *Optional* AWS region to use. | `aws-sdk default` |
+| ~~region~~ (deprecated) | `string`  | Set this in the `options` | |
+| formatOptions | `object`  | Formatting options to auto parse dates and coerce native JavaScript date objects to MySQL supported date formats. Valid keys are `deserializeDate` and `treatAsLocalDate`. Both accept boolean values. | Both `false` |
+
+### Connection Reuse
+It is recommended to enable connection reuse as this dramatically decreases the latency of subsequent calls to the AWS API. This can be done by setting an environment variable
+`AWS_NODEJS_CONNECTION_REUSE_ENABLED=1`. For more information see the [AWS SDK documentation](https://docs.aws.amazon.com/sdk-for-javascript/v2/developer-guide/node-reusing-connections.html).
 
 ## How to use this module
 
@@ -227,6 +237,35 @@ SELECT `id`, `name`, `created` FROM `table_123abc` WHERE id > :id LIMIT 10
 
 You'll notice that we leave the *named parameters* alone. Anything that Data API and the `RDSDataService` Class currently handles, we defer to them.
 
+### Type-Casting
+The Aurora Data API can sometimes give you trouble with certain data types, such as uuid, unless you explicitly cast them. While you can certainly do this manually in your SQL string, the Data API Client offers a really easy way to handle this for you.
+
+```javascript
+const result = await data.query(
+  'INSERT INTO users(id, email, full_name, metadata) VALUES(:id, :email, :fullName, :metadata)',
+  [
+    {
+      name: 'id',
+      value: newUserId,
+      cast: 'uuid'
+    },
+    {
+      name: 'email',
+      value: email
+    },
+    {
+      name: 'fullName',
+      value: fullName
+    },
+    {
+      name: 'metadata',
+      value: JSON.stringify(userMetadata),
+      cast: 'jsonb'
+    }
+  ]
+)
+```
+
 ### Batch Queries
 The `RDSDataService` Class provides a `batchExecuteStatement` method that allows you to execute a prepared statement multiple times using different parameter sets. This is only allowed for `INSERT`, `UPDATE` and `DELETE` queries, but is much more efficient than issuing multiple `executeStatement` calls. The Data API Client handles the switching for you based on *how* you send in your parameters.
 
@@ -285,7 +324,7 @@ The Data API Client exposes *promisified* versions of the five RDSDataService me
 - `executeStatement`
 - `rollbackTransaction`
 
-The default configuration information (`resourceArn`, `secretArn`, and `database`) are merge with your supplied parameters, so supplying those values are optional.
+The default configuration information (`resourceArn`, `secretArn`, and `database`) are merged with your supplied parameters, so supplying those values are optional.
 
 ```javascript
 let result = await data.executeStatement({
@@ -369,7 +408,7 @@ You can then configure your rotation settings, if you want, and then you review 
 
 ### Required Permissions
 
-In order to use the Data API, your execution environment requires several IAM permissions. Below are the minimum permissions required.
+In order to use the Data API, your execution environment requires several IAM permissions. Below are the minimum permissions required. **Please Note:** The `Resource: "*"` permission for `rds-data` is recommended by AWS (see [here](https://docs.aws.amazon.com/IAM/latest/UserGuide/list_amazonrdsdataapi.html#amazonrdsdataapi-resources-for-iam-policies)) because Amazon RDS Data API does not support specifying a resource ARN. The credentials specified in Secrets Manager can be used to restrict access to specific databases.
 
 **YAML:**
 ```yaml
@@ -382,7 +421,7 @@ Statement:
       - "rds-data:BeginTransaction"
       - "rds-data:RollbackTransaction"
       - "rds-data:CommitTransaction"
-    Resource: "arn:aws:rds:{REGION}:{ACCOUNT-ID}:cluster:{YOUR-CLUSTER-NAME}"
+    Resource: "*"
   - Effect: "Allow"
     Action:
       - "secretsmanager:GetSecretValue"
@@ -402,7 +441,7 @@ Statement:
       "rds-data:RollbackTransaction",
       "rds-data:CommitTransaction"
     ],
-    "Resource": "arn:aws:rds:{REGION}:{ACCOUNT-ID}:cluster:{YOUR-CLUSTER-NAME}"
+    "Resource": "*"
   },
   {
     "Effect": "Allow",
@@ -411,6 +450,11 @@ Statement:
   }
 ]
 ```
+
+## Sponsors
+
+[![New Relic](https://user-images.githubusercontent.com/2053544/96728664-55238700-1382-11eb-93cb-82fe7cb5e043.png)](https://ad.doubleclick.net/ddm/trackclk/N1116303.3950900PODSEARCH.COM/B24770737.285235234;dc_trk_aid=479074825;dc_trk_cid=139488579;dc_lat=;dc_rdid=;tag_for_child_directed_treatment=;tfua=;gdpr=${GDPR};gdpr_consent=${GDPR_CONSENT_755})
+<IMG SRC="https://ad.doubleclick.net/ddm/trackimp/N1116303.3950900PODSEARCH.COM/B24770737.285235234;dc_trk_aid=479074825;dc_trk_cid=139488579;ord=[timestamp];dc_lat=;dc_rdid=;tag_for_child_directed_treatment=;tfua=;gdpr=${GDPR};gdpr_consent=${GDPR_CONSENT_755}?" BORDER="0" HEIGHT="1" WIDTH="1" ALT="Advertisement">
 
 ## Contributions
 Contributions, ideas and bug reports are welcome and greatly appreciated. Please add [issues](https://github.com/jeremydaly/data-api-client/issues) for suggestions and bug reports or create a pull request. You can also contact me on Twitter: [@jeremy_daly](https://twitter.com/jeremy_daly).

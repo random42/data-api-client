@@ -8,7 +8,7 @@
  * https://docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/data-api.html
  *
  * @author Jeremy Daly <jeremy@jeremydaly.com>
- * @version 1.0.0-beta
+ * @version 1.2.0
  * @license MIT
  */
 
@@ -30,21 +30,6 @@ const supportedTypes = [
   'stringValue',
   'structValue'
 ]
-
-/**********************************************************************/
-/** Enable HTTP Keep-Alive per https://vimeo.com/287511222          **/
-/** This dramatically increases the speed of subsequent HTTP calls  **/
-/**********************************************************************/
-
-const https = require('https')
-
-const sslAgent = new https.Agent({
-  keepAlive: true,
-  maxSockets: 50, // same as aws-sdk
-  rejectUnauthorized: true  // same as aws-sdk
-})
-sslAgent.setMaxListeners(0) // same as aws-sdk
-
 
 /********************************************************************/
 /**  PRIVATE METHODS                                               **/
@@ -75,13 +60,26 @@ const parseDatabase = (config,args) =>
   : typeof args[0].database === 'string' ? args[0].database
   : args[0].database ? error('\'database\' must be a string.')
   : config.database ? config.database
-  : error('No \'database\' provided.')
+  : undefined // removed for #47 - error('No \'database\' provided.')
 
 // Parse the supplied hydrateColumnNames command, or default to config
 const parseHydrate = (config,args) =>
   typeof args[0].hydrateColumnNames === 'boolean' ? args[0].hydrateColumnNames
   : args[0].hydrateColumnNames ? error('\'hydrateColumnNames\' must be a boolean.')
   : config.hydrateColumnNames
+
+// Parse the supplied format options, or default to config
+const parseFormatOptions = (config,args) =>
+  typeof args[0].formatOptions === 'object' ? {
+    deserializeDate: typeof args[0].formatOptions.deserializeDate === 'boolean' ? args[0].formatOptions.deserializeDate
+    : args[0].formatOptions.deserializeDate ? error('\'formatOptions.deserializeDate\' must be a boolean.')
+    : config.formatOptions.deserializeDate,
+    treatAsLocalDate: typeof args[0].formatOptions.treatAsLocalDate == 'boolean' ? args[0].formatOptions.treatAsLocalDate
+    : args[0].formatOptions.treatAsLocalDate ? error('\'formatOptions.treatAsLocalDate\' must be a boolean.')
+    : config.formatOptions.treatAsLocalDate
+  }
+  : args[0].formatOptions ? error('\'formatOptions\' must be an object.')
+  : config.formatOptions
 
 // Prepare method params w/ supplied inputs if an object is passed
 const prepareParams = ({ secretArn,resourceArn },args) => {
@@ -106,27 +104,38 @@ const pick = (obj,values) => Object.keys(obj).reduce((acc,x) =>
 const flatten = arr => arr.reduce((acc,x) => acc.concat(x),[])
 
 // Normize parameters so that they are all in standard format
-const normalizeParams = params => params.reduce((acc,p) =>
+const normalizeParams = params => params.reduce((acc, p) =>
   Array.isArray(p) ? acc.concat([normalizeParams(p)])
-  : Object.keys(p).length === 2 && p.name && p.value ? acc.concat(p)
-  : acc.concat(splitParams(p))
-,[]) // end reduce
-
+  : (
+    (Object.keys(p).length === 2 && p.name && typeof p.value !== 'undefined') ||
+    (Object.keys(p).length === 3 && p.name && typeof p.value !== 'undefined' && p.cast)
+  ) ? acc.concat(p)
+    : acc.concat(splitParams(p))
+, []) // end reduce
 
 // Prepare parameters
-const processParams = (sql,sqlParams,params,row=0) => {
+const processParams = (engine,sql,sqlParams,params,formatOptions,row=0) => {
   return {
     processedParams: params.reduce((acc,p) => {
       if (Array.isArray(p)) {
-        let result = processParams(sql,sqlParams,p,row)
+        const result = processParams(engine,sql,sqlParams,p,formatOptions,row)
         if (row === 0) { sql = result.escapedSql; row++ }
         return acc.concat([result.processedParams])
       } else if (sqlParams[p.name]) {
         if (sqlParams[p.name].type === 'n_ph') {
-          acc.push(formatParam(p.name,p.value))
+          if (p.cast) {
+            const regex = new RegExp(':' + p.name + '\\b', 'g')
+            sql = sql.replace(
+              regex,
+              engine === 'pg'
+                ? `:${p.name}::${p.cast}`
+                : `CAST(:${p.name} AS ${p.cast})`
+            )
+          }
+          acc.push(formatParam(p.name,p.value,formatOptions))
         } else if (row === 0) {
-          let regex = new RegExp('::' + p.name + '\\b','g')
-          sql = sql.replace(regex,sqlString.escapeId(p.value))
+          const regex = new RegExp('::' + p.name + '\\b', 'g')
+          sql = sql.replace(regex, sqlString.escapeId(p.value))
         }
         return acc
       } else {
@@ -138,7 +147,7 @@ const processParams = (sql,sqlParams,params,row=0) => {
 }
 
 // Converts parameter to the name/value format
-const formatParam = (n,v) => formatType(n,v,getType(v))
+const formatParam = (n,v,formatOptions) => formatType(n,v,getType(v),getTypeHint(v),formatOptions)
 
 // Converts object params into name/value format
 const splitParams = p => Object.keys(p).reduce((arr,x) =>
@@ -174,6 +183,7 @@ const getType = val =>
   : typeof val === 'number' && parseInt(val) === val ? 'longValue'
   : typeof val === 'number' && parseFloat(val) === val ? 'doubleValue'
   : val === null ? 'isNull'
+  : isDate(val) ? 'stringValue'
   : Buffer.isBuffer(val) ? 'blobValue'
   // : Array.isArray(val) ? 'arrayValue' This doesn't work yet
   // TODO: there is a 'structValue' now for postgres
@@ -182,19 +192,55 @@ const getType = val =>
     && supportedTypes.includes(Object.keys(val)[0]) ? null
   : undefined
 
+// Hint to specify the underlying object type for data type mapping
+const getTypeHint = val =>
+  isDate(val) ? 'TIMESTAMP' : undefined
+
+const isDate = val =>
+  val instanceof Date
+
 // Creates a standard Data API parameter using the supplied inputs
-const formatType = (name,value,type) => {
+const formatType = (name,value,type,typeHint,formatOptions) => {
   return Object.assign(
-    { name },
+    typeHint != null ? { name, typeHint } : { name },
     type === null ? { value }
     : {
       value: {
         [type ? type : error(`'${name}' is an invalid type`)]
-        : type === 'isNull' ? true : value
+        : type === 'isNull' ? true
+        : isDate(value) ? formatToTimeStamp(value, formatOptions && formatOptions.treatAsLocalDate)
+        : value
       }
     }
   )
 } // end formatType
+
+// Formats the (UTC) date to the AWS accepted YYYY-MM-DD HH:MM:SS[.FFF] format
+// See https://docs.aws.amazon.com/rdsdataservice/latest/APIReference/API_SqlParameter.html
+const formatToTimeStamp = (date, treatAsLocalDate) => {
+  const pad = (val,num=2) => '0'.repeat(num-(val + '').length) + val
+
+  const year = treatAsLocalDate ? date.getFullYear() : date.getUTCFullYear()
+  const month = (treatAsLocalDate ? date.getMonth() : date.getUTCMonth()) + 1 // Convert to human month
+  const day = treatAsLocalDate ? date.getDate() : date.getUTCDate()
+
+  const hours = treatAsLocalDate ? date.getHours() : date.getUTCHours()
+  const minutes = treatAsLocalDate ? date.getMinutes() : date.getUTCMinutes()
+  const seconds = treatAsLocalDate ? date.getSeconds() : date.getUTCSeconds()
+  const ms = treatAsLocalDate ? date.getMilliseconds() : date.getUTCMilliseconds()
+
+  const fraction = ms <= 0 ? '' : `.${pad(ms,3)}`
+
+  return `${year}-${pad(month)}-${pad(day)} ${pad(hours)}:${pad(minutes)}:${pad(seconds)}${fraction}`
+}
+
+// Converts the string value to a Date object.
+// If standard TIMESTAMP format (YYYY-MM-DD[ HH:MM:SS[.FFF]]) without TZ + treatAsLocalDate=false then assume UTC Date
+// In all other cases convert value to datetime as-is (also values with TZ info)
+const formatFromTimeStamp = (value,treatAsLocalDate) =>
+  !treatAsLocalDate && /^\d{4}-\d{2}-\d{2}(\s\d{2}:\d{2}:\d{2}(\.\d{3})?)?$/.test(value) ?
+    new Date(value + 'Z') :
+    new Date(value)
 
 // Formats the results of a query response
 const formatResults = (
@@ -207,18 +253,17 @@ const formatResults = (
   },
   hydrate,
   includeMeta,
-  convertSnakeToCamel
-) =>
-  Object.assign(
-    includeMeta ? { columnMetadata } : {},
-    numberOfRecordsUpdated !== undefined && !records ? { numberOfRecordsUpdated } : {},
-    records ? {
-      records: formatRecords(records, hydrate ? columnMetadata : false, convertSnakeToCamel)
-    } : {},
-    updateResults ? { updateResults: formatUpdateResults(updateResults) } : {},
-    generatedFields && generatedFields.length > 0 ?
-      { insertId: generatedFields[0].longValue } : {}
-  )
+  formatOptions
+) => Object.assign(
+  includeMeta ? { columnMetadata } : {},
+  numberOfRecordsUpdated !== undefined && !records ? { numberOfRecordsUpdated } : {},
+  records ? {
+    records: formatRecords(records, columnMetadata, hydrate, formatOptions)
+  } : {},
+  updateResults ? { updateResults: formatUpdateResults(updateResults) } : {},
+  generatedFields && generatedFields.length > 0 ?
+    { insertId: generatedFields[0].longValue } : {}
+)
 
 const snakeToCamel = (value) =>  value.replace(
   /([-_][a-z])/g,
@@ -227,17 +272,14 @@ const snakeToCamel = (value) =>  value.replace(
 
 // Processes records and either extracts Typed Values into an array, or
 // object with named column labels
-const formatRecords = (recs,columns ,convertSnakeToCamel) => {
-
-  if(convertSnakeToCamel){
+const formatRecords = (recs,columns,hydrate,formatOptions) => {
+  if(formatOptions.convertSnakeToCamel){
     columns.filter(c => c.label.includes('_')).forEach(c => c.label = snakeToCamel(c.label))
   }
-  
-
   // Create map for efficient value parsing
   let fmap = recs && recs[0] ? recs[0].map((x,i) => {
     return Object.assign({},
-      columns ? { label: columns[i].label } : {} ) // add column labels
+      columns ? { label: columns[i].label, typeName: columns[i].typeName } : {} ) // add column label and typeName
   }) : {}
 
   // Map over all the records (rows)
@@ -248,15 +290,16 @@ const formatRecords = (recs,columns ,convertSnakeToCamel) => {
 
       // If the field is null, always return null
       if (field.isNull === true) {
-        return columns ? // object if hydrate, else array
+        return hydrate ? // object if hydrate, else array
           Object.assign(acc,{ [fmap[i].label]: null })
           : acc.concat(null)
 
       // If the field is mapped, return the mapped field
-      } else if (fmap[i] && fmap[i].field && Object.keys(field)[0] !== 'arrayValue') {
-        return columns ? // object if hydrate, else array
-          Object.assign(acc,{ [fmap[i].label]: field[fmap[i].field] })
-          : acc.concat(field[fmap[i].field])
+      } else if (fmap[i] && fmap[i].field) {
+        const value = formatRecordValue(field[fmap[i].field],fmap[i].typeName,formatOptions)
+        return hydrate ? // object if hydrate, else array
+          Object.assign(acc,{ [fmap[i].label]: value })
+          : acc.concat(value)
 
       // Else discover the field type
       } else {
@@ -275,14 +318,21 @@ const formatRecords = (recs,columns ,convertSnakeToCamel) => {
         })
 
         // Return the mapped field (this should NEVER be null)
-        return columns ? // object if hydrate, else array
-          Object.assign(acc,{ [fmap[i].label]: field[fmap[i].field] })
-          : acc.concat(field[fmap[i].field])
+        const value = formatRecordValue(field[fmap[i].field],fmap[i].typeName,formatOptions)
+        return hydrate ? // object if hydrate, else array
+          Object.assign(acc,{ [fmap[i].label]: value })
+          : acc.concat(value)
       }
 
-    }, columns ? {} : []) // init object if hydrate, else init array
+    }, hydrate ? {} : []) // init object if hydrate, else init array
   }) : [] // empty record set returns an array
 } // end formatRecords
+
+// Format record value based on its value, the database column's typeName and the formatting options
+const formatRecordValue = (value,typeName,formatOptions) => formatOptions && formatOptions.deserializeDate &&
+  ['DATE', 'DATETIME', 'TIMESTAMP', 'TIMESTAMP WITH TIME ZONE'].includes(typeName)
+  ? formatFromTimeStamp(value,(formatOptions && formatOptions.treatAsLocalDate) || typeName === 'TIMESTAMP WITH TIME ZONE')
+  : value
 
 // Format updateResults and extract insertIds
 const formatUpdateResults = res => res.map(x => {
@@ -303,7 +353,6 @@ const mergeConfig = (initialConfig,args) =>
 
 // Query function (use standard form for `this` context)
 const query = async function(config,..._args) {
-
   // Flatten array if nested arrays (fixes #30)
   const args = Array.isArray(_args[0]) ? flatten(_args) : _args
 
@@ -314,15 +363,18 @@ const query = async function(config,..._args) {
   // Parse hydration setting
   const hydrateColumnNames = parseHydrate(config,args)
 
+  // Parse data format settings
+  const formatOptions = parseFormatOptions(config,args)
+
   // Parse and normalize parameters
   const parameters = normalizeParams(parseParams(args))
 
   // Process parameters and escape necessary SQL
-  const { processedParams,escapedSql } = processParams(sql,sqlParams,parameters)
+  const { processedParams,escapedSql } = processParams(config.engine,sql,sqlParams,parameters,formatOptions)
 
   // Determine if this is a batch request
   const isBatch = processedParams.length > 0
-    && Array.isArray(processedParams[0]) ? true : false
+    && Array.isArray(processedParams[0])
 
   // Create/format the parameters
   const params = Object.assign(
@@ -341,7 +393,7 @@ const query = async function(config,..._args) {
     config.transactionId ? { transactionId: config.transactionId } : {}
   ) // end params
 
-  try { // attempt to run the query
+  try { // attempt to run the query  
 
     // Capture the result for debugging
     let result = await (isBatch ? config.RDS.batchExecuteStatement(params).promise()
@@ -351,8 +403,8 @@ const query = async function(config,..._args) {
     return formatResults(
       result,
       hydrateColumnNames,
-      args[0].includeResultMetadata === true ? true : false,
-      config.convertSnakeToCamel
+      args[0].includeResultMetadata === true,
+      formatOptions
     )
 
   } catch(e) {
@@ -388,6 +440,7 @@ const transaction = (config,_args) => {
     {
       database: parseDatabase(config,args), // add database
       hydrateColumnNames: parseHydrate(config,args), // add hydrate
+      formatOptions: parseFormatOptions(config,args), // add formatOptions
       RDS: config.RDS // reference the RDSDataService instance
     }
   )
@@ -447,32 +500,49 @@ const commit = async (config,queries,rollback) => {
 /********************************************************************/
 
 // Export main function
-module.exports = (params) => {
+/**
+ * Create a Data API client instance
+ * @param {object} params
+ * @param {'mysql'|'pg'} [params.engine=mysql] The type of database (MySQL or Postgres)
+ * @param {string} params.resourceArn The ARN of your Aurora Serverless Cluster
+ * @param {string} params.secretArn The ARN of the secret associated with your
+ *   database credentials
+ * @param {string} [params.database] The name of the database
+ * @param {boolean} [params.hydrateColumnNames=true] Return objects with column
+ *   names as keys
+ * @param {object} [params.options={}] Configuration object passed directly
+ *   into RDSDataService
+ * @param {object} [params.formatOptions] Date-related formatting options
+ * @param {boolean} [params.formatOptions.deserializeDate=false]
+ * @param {boolean} [params.formatOptions.treatAsLocalDate=false]
+ * @param {boolean} [params.keepAlive] DEPRECATED
+ * @param {boolean} [params.sslEnabled=true] DEPRECATED
+ * @param {string} [params.region] DEPRECATED
+ *
+ */
+const init = params => {
 
   // Set the options for the RDSDataService
   const options = typeof params.options === 'object' ? params.options
     : params.options !== undefined ? error('\'options\' must be an object')
     : {}
 
-  // Update the default AWS http agent with our new sslAgent
-  if (typeof params.keepAlive === 'boolean' ? params.keepAlive : true) {
-    AWS.config.update({ httpOptions: { agent: sslAgent } })
-  }
-
   // Update the AWS http agent with the region
   if (typeof params.region === 'string') {
-    AWS.config.update({ region: params.region })
+    options.region = params.region
   }
 
   // Disable ssl if wanted for local development
   if (params.sslEnabled === false) {
-    // AWS.config.update({ sslEnabled: false })
     options.sslEnabled = false
   }
 
-
   // Set the configuration for this instance
   const config = {
+    // Require engine
+    engine: typeof params.engine === 'string' ?
+      params.engine
+      : 'mysql',
 
     // Require secretArn
     secretArn: typeof params.secretArn === 'string' ?
@@ -500,11 +570,21 @@ module.exports = (params) => {
       typeof params.hydrateColumnNames === 'boolean' ?
         params.hydrateColumnNames : true,
 
+    // Value formatting options. For date the deserialization is enabled and (re)stored as UTC
+    formatOptions: {
+      deserializeDate:
+        typeof params.formatOptions === 'object' && params.formatOptions.deserializeDate === false ? false : true,
+      treatAsLocalDate:
+        typeof params.formatOptions === 'object' && params.formatOptions.treatAsLocalDate
+      convertSnakeToCamel: params.convertSnakeToCamel
+        || typeof params.formatOptions === 'object' && params.formatOptions.convertSnakeToCamel
+        || false,
+    },
+
     // TODO: Put this in a separate module for testing?
     // Create an instance of RDSDataService
     RDS: new AWS.RDSDataService(options),
 
-    convertSnakeToCamel: params.convertSnakeToCamel || false,
 
   } // end config
 
@@ -539,3 +619,5 @@ module.exports = (params) => {
   }
 
 } // end exports
+
+module.exports = init
